@@ -1,4 +1,4 @@
-use super::optimizer::{self, Optimizer as _};
+use super::optimizer;
 use super::planner::Planner;
 use crate::error::Result;
 use crate::sql::engine::{Catalog, Transaction};
@@ -63,11 +63,11 @@ impl Plan {
     /// Optimizes the plan, consuming it.
     pub fn optimize(self) -> Result<Self> {
         let optimize = |mut node| -> Result<Node> {
-            node = optimizer::ConstantFolder.optimize(node)?;
-            node = optimizer::FilterPushdown.optimize(node)?;
-            node = optimizer::IndexLookup.optimize(node)?;
-            node = optimizer::NoopCleaner.optimize(node)?;
-            node = optimizer::JoinType.optimize(node)?;
+            node = optimizer::fold_constants(node)?;
+            node = optimizer::push_filters(node)?;
+            node = optimizer::index_lookup(node)?;
+            node = optimizer::join_type(node)?;
+            node = optimizer::short_circuit(node)?;
             Ok(node)
         };
         Ok(match self {
@@ -121,7 +121,6 @@ pub enum Node {
     /// right source and iterating over it for every row in the left source.
     /// When outer is true (e.g. LEFT JOIN), a left row without a right match is
     /// emitted anyway, with NULLs for the right row.
-    /// TODO: do we need left_size?
     NestedLoopJoin {
         left: Box<Node>,
         left_size: usize,
@@ -130,9 +129,11 @@ pub enum Node {
         predicate: Option<Expression>,
         outer: bool,
     },
-    /// Emits a single empty row. Used for SELECT queries with no FROM clause.
-    /// TODO: replace with Values, but requires changes to aggregate planning.
+    /// Nothing does not emit anything.
     Nothing,
+    /// Emits a single empty row. Used for SELECT queries with no FROM clause.
+    /// TODO: remove this.
+    EmptyRow,
     /// Discards the first offset rows from source, emits the rest.
     Offset { source: Box<Node>, offset: usize },
     /// Sorts the source rows by the given expression/direction pairs. Buffers
@@ -208,6 +209,7 @@ impl Node {
 
             node @ (Self::IndexLookup { .. }
             | Self::KeyLookup { .. }
+            | Self::EmptyRow
             | Self::Nothing
             | Self::Scan { .. }
             | Self::Values { .. }) => node,
@@ -267,15 +269,16 @@ impl Node {
                     .collect::<Result<_>>()?,
             },
 
-            node @ Self::Aggregation { .. }
-            | node @ Self::HashJoin { .. }
-            | node @ Self::IndexLookup { .. }
-            | node @ Self::KeyLookup { .. }
-            | node @ Self::Limit { .. }
-            | node @ Self::NestedLoopJoin { predicate: None, .. }
-            | node @ Self::Nothing
-            | node @ Self::Offset { .. }
-            | node @ Self::Scan { filter: None, .. } => node,
+            node @ (Self::Aggregation { .. }
+            | Self::HashJoin { .. }
+            | Self::IndexLookup { .. }
+            | Self::KeyLookup { .. }
+            | Self::Limit { .. }
+            | Self::NestedLoopJoin { predicate: None, .. }
+            | Self::Nothing
+            | Self::EmptyRow
+            | Self::Offset { .. }
+            | Self::Scan { filter: None, .. }) => node,
         })
     }
 }
@@ -406,8 +409,11 @@ impl Node {
                 left.format(f, prefix.clone(), false, false)?;
                 right.format(f, prefix, false, true)?;
             }
-            Self::Nothing {} => {
+            Self::Nothing => {
                 write!(f, "Nothing")?;
+            }
+            Self::EmptyRow => {
+                write!(f, "EmptyRow")?;
             }
             Self::Offset { source, offset } => {
                 write!(f, "Offset: {offset}")?;

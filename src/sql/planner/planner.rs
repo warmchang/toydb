@@ -159,7 +159,7 @@ impl<'a, C: Catalog> Planner<'a, C> {
         } else if select.is_empty() {
             return errinput!("can't select * without a table");
         } else {
-            Node::Nothing
+            Node::EmptyRow
         };
 
         // Build WHERE clause.
@@ -611,8 +611,6 @@ impl<'a, C: Catalog> Planner<'a, C> {
 /// currently visible and what names they have. During expression planning, the
 /// scope is used to resolve column names to column indexes, which are placed in
 /// the plan and used during execution.
-///
-/// TODO: try to use borrows in the scope, to avoid cloning all the time.
 pub struct Scope {
     /// The currently visible columns. If empty, only constant expressions can
     /// be used (no field references).

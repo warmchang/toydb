@@ -12,7 +12,7 @@ use std::collections::{HashMap, HashSet};
 /// A SQL engine using local storage. This provides the main SQL storage logic,
 /// including with the Raft SQL engine which dispatches to this engine for
 /// node-local SQL storage.
-pub struct Local<E: storage::Engine> {
+pub struct Local<E: storage::Engine + 'static> {
     /// The local MVCC storage engine.
     pub(super) mvcc: mvcc::MVCC<E>,
 }
@@ -42,7 +42,7 @@ impl<E: storage::Engine> Local<E> {
     }
 }
 
-impl<'a, E: storage::Engine + 'a> super::Engine<'a> for Local<E> {
+impl<'a, E: storage::Engine> super::Engine<'a> for Local<E> {
     type Transaction = Transaction<E>;
 
     fn begin(&self) -> Result<Self::Transaction> {
@@ -59,7 +59,7 @@ impl<'a, E: storage::Engine + 'a> super::Engine<'a> for Local<E> {
 }
 
 /// A SQL transaction, wrapping an MVCC transaction.
-pub struct Transaction<E: storage::Engine> {
+pub struct Transaction<E: storage::Engine + 'static> {
     txn: mvcc::Transaction<E>,
 }
 
@@ -96,7 +96,8 @@ impl<E: storage::Engine> Transaction<E> {
 
     /// Returns true if the given secondary index exists.
     fn has_index(&self, table: &str, column: &str) -> Result<bool> {
-        Ok(self.must_get_table(table)?.get_column(column)?.index)
+        let table = self.must_get_table(table)?;
+        Ok(table.columns.iter().find(|c| c.name == column).map(|c| c.index).unwrap_or(false))
     }
 
     /// Stores a secondary index entry for the given column value, replacing the
@@ -251,7 +252,6 @@ impl<E: storage::Engine> super::Transaction for Transaction<E> {
         Ok(Box::new(
             self.txn
                 .scan_prefix(&KeyPrefix::Row(table.into()).encode())
-                .iter()
                 .map(|r| r.and_then(|(_, v)| Row::decode(&v)))
                 .filter_map(move |r| match r {
                     Ok(row) => match &filter {
@@ -264,30 +264,23 @@ impl<E: storage::Engine> super::Transaction for Transaction<E> {
                         None => Some(Ok(row)),
                     },
                     err => Some(err),
-                })
-                // TODO: don't collect.
-                .collect::<Vec<_>>()
-                .into_iter(),
+                }),
         ))
     }
 
     fn scan_index(&self, table: &str, column: &str) -> Result<super::IndexScan> {
         debug_assert!(self.has_index(table, column)?, "index scan without index");
         Ok(Box::new(
-            self.txn
-                .scan_prefix(&KeyPrefix::Index(table.into(), column.into()).encode())
-                .iter()
-                .map(|r| {
+            self.txn.scan_prefix(&KeyPrefix::Index(table.into(), column.into()).encode()).map(
+                |r| {
                     r.and_then(|(k, v)| {
                         let Key::Index(_, _, value) = Key::decode(&k)? else {
                             return errdata!("invalid index key");
                         };
                         Ok((value.into_owned(), HashSet::decode(&v)?))
                     })
-                })
-                // TODO: don't collect.
-                .collect::<Vec<_>>()
-                .into_iter(),
+                },
+            ),
         ))
     }
 
@@ -376,7 +369,6 @@ impl<E: storage::Engine> Catalog for Transaction<E> {
         let keys: Vec<Vec<u8>> = self
             .txn
             .scan_prefix(&KeyPrefix::Row((&table.name).into()).encode())
-            .iter()
             .map(|r| r.map(|(key, _)| key))
             .collect::<Result<_>>()?;
         for key in keys {
@@ -390,7 +382,6 @@ impl<E: storage::Engine> Catalog for Transaction<E> {
                 .scan_prefix(
                     &KeyPrefix::Index((&table.name).into(), (&column.name).into()).encode(),
                 )
-                .iter()
                 .map(|r| r.map(|(key, _)| key))
                 .collect::<Result<_>>()?;
             for key in keys {
@@ -408,7 +399,6 @@ impl<E: storage::Engine> Catalog for Transaction<E> {
     fn list_tables(&self) -> Result<Vec<Table>> {
         self.txn
             .scan_prefix(&KeyPrefix::Table.encode())
-            .iter()
             .map(|r| r.and_then(|(_, v)| Table::decode(&v)))
             .collect()
     }
@@ -420,9 +410,6 @@ impl<E: storage::Engine> Catalog for Transaction<E> {
 /// table/column names, so this is fine.
 ///
 /// Uses Cow to allow encoding borrowed values but decoding owned values.
-///
-/// TODO: add helper methods here to encode borrowed keys. This should also
-/// encode into a reused byte buffer, see keycode::serialize() comment.
 #[derive(Deserialize, Serialize)]
 enum Key<'a> {
     /// A table schema by table name.

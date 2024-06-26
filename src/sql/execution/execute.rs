@@ -104,6 +104,8 @@ pub fn execute(node: Node, txn: &impl Transaction) -> Result<Rows> {
 
         Node::Nothing => Ok(source::nothing()),
 
+        Node::EmptyRow => Ok(source::empty_row()),
+
         Node::Offset { source, offset } => {
             let source = execute(*source, txn)?;
             Ok(transform::offset(source, offset))
